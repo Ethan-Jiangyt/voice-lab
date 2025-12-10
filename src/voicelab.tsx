@@ -71,6 +71,8 @@ export default function GeminiTTSBenchmark() {
 
   // --- Logic ---
 
+  const delay = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
+
   const fileToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader();
@@ -145,24 +147,55 @@ export default function GeminiTTSBenchmark() {
         }
       `;
 
-      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: systemInstruction }] },
-          contents: [{
-            parts: [
-              { text: userPrompt },
-              { inlineData: { mimeType: goldenFile.type || "audio/wav", data: goldenB64 } }, // Audio A (Gold)
-              { inlineData: { mimeType: testFile.type || "audio/wav", data: testB64 } }  // Audio B (Test)
-            ]
-          }],
-          generationConfig: { responseMimeType: "application/json" }
-        })
-      });
+      // --- RETRY LOGIC WITH EXPONENTIAL BACKOFF ---
+      const maxRetries = 5;
+      let attempt = 0;
+      let success = false;
+      let data;
 
-      const data = await response.json();
-      if (data.error) throw new Error(data.error.message);
+      while (attempt < maxRetries && !success) {
+        try {
+          const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: systemInstruction }] },
+              contents: [{
+                parts: [
+                  { text: userPrompt },
+                  { inlineData: { mimeType: goldenFile.type || "audio/wav", data: goldenB64 } },
+                  { inlineData: { mimeType: testFile.type || "audio/wav", data: testB64 } }
+                ]
+              }],
+              generationConfig: { responseMimeType: "application/json" }
+            })
+          });
+
+          // Check for 503 Service Unavailable (overloaded)
+          if (response.status === 503) {
+            throw new Error("Model is overloaded");
+          }
+
+          if (!response.ok) {
+            const errorData = await response.json();
+            throw new Error(errorData.error?.message || "API Error");
+          }
+
+          data = await response.json();
+          if (data.error) throw new Error(data.error.message);
+          success = true;
+
+        } catch (err) {
+          attempt++;
+          if (attempt === maxRetries) throw err; // Give up after 5 tries
+          
+          const waitTime = attempt * 2000; // 2s, 4s, 6s, 8s, 10s
+          console.log(`Attempt ${attempt} failed. Retrying in ${waitTime / 1000} seconds...`);
+          setError(`Server busy, retrying (${attempt}/${maxRetries})...`);
+          await delay(waitTime);
+        }
+      }
+      // --- END RETRY LOGIC ---
       
       const jsonResult = JSON.parse(data.candidates?.[0]?.content?.parts?.[0]?.text || "{}") as AnalysisResult;
       setResults(jsonResult);
@@ -170,7 +203,7 @@ export default function GeminiTTSBenchmark() {
     } catch (err) {
       console.error(err);
       const errorMessage = err instanceof Error ? err.message : "Analysis failed.";
-      setError(errorMessage);
+      setError(`Error: ${errorMessage}. Please try again in a moment.`);
     } finally {
       setIsAnalyzing(false);
     }
